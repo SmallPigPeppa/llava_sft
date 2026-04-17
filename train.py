@@ -235,6 +235,19 @@ def load_model_and_processor(model_cfg: dict[str, Any]) -> tuple[LlavaForConditi
             ),
         )
         model = get_peft_model(model, lora_cfg)
+        model = get_peft_model(model, lora_cfg)
+        model.print_trainable_parameters()
+
+        if model_cfg.get("gradient_checkpointing", True):
+            if hasattr(model, "gradient_checkpointing_enable"):
+                try:
+                    model.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": True}
+                    )
+                except TypeError:
+                    model.gradient_checkpointing_enable()
+            if hasattr(model, "config"):
+                model.config.use_cache = False
         model.print_trainable_parameters()
 
     return model, processor
