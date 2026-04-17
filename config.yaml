@@ -1,0 +1,49 @@
+model:
+  name_or_path: llava-hf/llava-1.5-7b-hf
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  gradient_checkpointing: true
+  do_pad: true
+
+  # 极简默认：LoRA。想全参微调就改成 false。
+  use_lora: true
+  lora_r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  lora_target: ".*language_model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
+  num_additional_image_tokens: 1
+
+data:
+  path: json
+  data_files: /ppio_net0/code/LFactory/data/mllm_demo.json
+  split: train
+  image_root: /ppio_net0/code/LFactory/data
+  image_token: "<image>"
+  max_length: 2048
+  max_samples: null
+
+train:
+  output_dir: ./output_llava15_7b_sft
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  num_train_epochs: 1
+  max_steps: null
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  weight_decay: 0.0
+
+  bf16: true
+  fp16: false
+  tf32: true
+
+  logging_steps: 10
+  save_steps: 500
+  save_total_limit: 2
+  dataloader_num_workers: 4
+  ddp_find_unused_parameters: false
+  report_to: none
+  optim: adamw_torch
+
+  deepspeed: null
+  resume_from_checkpoint: null

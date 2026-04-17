@@ -1,0 +1,7 @@
+torch
+transformers>=4.49.0
+datasets
+accelerate
+peft
+PyYAML
+Pillow
