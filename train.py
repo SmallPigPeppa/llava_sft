@@ -235,7 +235,6 @@ def load_model_and_processor(model_cfg: dict[str, Any]) -> tuple[LlavaForConditi
             ),
         )
         model = get_peft_model(model, lora_cfg)
-        model = get_peft_model(model, lora_cfg)
         model.print_trainable_parameters()
 
         if model_cfg.get("gradient_checkpointing", True):
