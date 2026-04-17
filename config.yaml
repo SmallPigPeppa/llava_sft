@@ -1,49 +1,48 @@
+seed: 42
+
 model:
   name_or_path: llava-hf/llava-1.5-7b-hf
-  torch_dtype: bfloat16
-  attn_implementation: sdpa
+  torch_dtype: float16
   gradient_checkpointing: true
-  do_pad: true
-
-  # 极简默认：LoRA。想全参微调就改成 false。
-  use_lora: true
-  lora_r: 64
-  lora_alpha: 128
-  lora_dropout: 0.05
-  lora_target: ".*language_model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
-  num_additional_image_tokens: 1
+  attn_implementation: null   # 可选: flash_attention_2 / sdpa / null
 
 data:
   path: json
   data_files: /ppio_net0/code/LFactory/data/mllm_demo.json
-  split: train
   image_root: /ppio_net0/code/LFactory/data
-  image_token: "<image>"
-  max_length: 2048
-  max_samples: null
+  max_length: 4096
+
+loader:
+  batch_size: 1
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0.05
+  bias: none
+  target_modules_regex: null  # 留空则自动只匹配 model.language_model 下的 Linear
 
 train:
-  output_dir: ./output_llava15_7b_sft
-  per_device_train_batch_size: 1
-  gradient_accumulation_steps: 8
-  learning_rate: 2.0e-5
-  num_train_epochs: 1
-  max_steps: null
-  warmup_ratio: 0.03
-  lr_scheduler_type: cosine
+  output_dir: /ppio_net0/code/LFactory/outputs/llava15_7b_lora_lightning
+  lr: 2.0e-4
   weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1.0e-4
 
-  bf16: true
-  fp16: false
-  tf32: true
-
-  logging_steps: 10
-  save_steps: 500
-  save_total_limit: 2
-  dataloader_num_workers: 4
-  ddp_find_unused_parameters: false
-  report_to: none
-  optim: adamw_torch
-
-  deepspeed: null
-  resume_from_checkpoint: null
+trainer:
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+  precision: 16-mixed         # 更稳；如果你强制纯 fp16，可改成 16-true
+  max_epochs: 3
+  accumulate_grad_batches: 8  # 用梯度累积拉大有效 batch
+  gradient_clip_val: 1.0
+  log_every_n_steps: 1
+  save_lightning_ckpt: false

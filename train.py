@@ -1,297 +1,565 @@
-from __future__ import annotations
-
 import argparse
+import json
 import os
-from typing import Any
+import re
+import shutil
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import lightning as L
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import yaml
-from datasets import load_dataset
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
+from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image
-from torch.utils.data import Dataset
-from transformers import AutoProcessor, LlavaForConditionalGeneration, Trainer, TrainingArguments
-
-try:
-    from peft import LoraConfig, get_peft_model
-except Exception:
-    LoraConfig = None
-    get_peft_model = None
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoProcessor, LlavaForConditionalGeneration
 
 
-def load_yaml(path: str) -> dict[str, Any]:
+IMAGE_TOKEN = "<image>"
+
+
+def load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def get_dtype(name: str) -> torch.dtype:
-    name = str(name).lower()
-    if name in {"fp16", "float16", "half"}:
-        return torch.float16
-    if name in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    return torch.float32
+
+def save_yaml(obj: Dict[str, Any], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(obj, f, allow_unicode=True, sort_keys=False)
 
 
-def split_mm_text(text: Any, image_token: str) -> tuple[list[dict[str, str]], int]:
-    if isinstance(text, list):
-        image_count = 0
-        for x in text:
-            if isinstance(x, dict) and x.get("type") == "image":
-                image_count += 1
-        return text, image_count
 
-    text = "" if text is None else str(text)
-    parts = text.split(image_token)
-    content: list[dict[str, str]] = []
-    image_count = 0
+def get_torch_dtype(name: str) -> torch.dtype:
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "half": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    key = name.lower()
+    if key not in mapping:
+        raise ValueError(f"Unsupported dtype: {name}")
+    return mapping[key]
+
+
+
+def load_image(path: str) -> Image.Image:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Image not found: {path}")
+    return Image.open(path).convert("RGB")
+
+
+
+def freeze_module(module: nn.Module) -> None:
+    for p in module.parameters():
+        p.requires_grad = False
+
+
+
+def freeze_all_parameters(module: nn.Module) -> None:
+    for p in module.parameters():
+        p.requires_grad = False
+
+
+
+def build_lm_target_regex(model: LlavaForConditionalGeneration) -> Tuple[str, List[str]]:
+    """
+    只从 language_model 下面收集 Linear，并生成一个只匹配语言模型路径的正则，
+    防止 q_proj/k_proj 这类名字把 vision_tower 也匹配进去。
+    """
+    leaf_names = set()
+    for name, sub_module in model.model.language_model.named_modules():
+        if isinstance(sub_module, nn.Linear):
+            leaf_names.add(name.split(".")[-1])
+
+    # 这些一般不想打 LoRA
+    leaf_names.discard("lm_head")
+    leaf_names.discard("embed_tokens")
+
+    if not leaf_names:
+        raise ValueError("No Linear modules found under model.model.language_model")
+
+    escaped = [re.escape(x) for x in sorted(leaf_names)]
+    pattern = rf"^model\.language_model\..*\.({'|'.join(escaped)})$"
+    return pattern, sorted(leaf_names)
+
+
+
+def assert_only_lora_trainable(model: nn.Module) -> None:
+    wrong = []
+    for name, p in model.named_parameters():
+        if p.requires_grad and "lora_" not in name:
+            wrong.append(name)
+    if wrong:
+        raise RuntimeError(
+            "Found non-LoRA trainable parameters, which violates the requirement that only the language model uses LoRA: "
+            + ", ".join(wrong[:20])
+        )
+
+
+
+def split_text_and_collect_images(
+    text: str,
+    image_paths: Sequence[str],
+    image_ptr: int,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    """
+    把类似 '<image>Who are they?<image>' 解析成 HF chat template 需要的 content list。
+    images 按 JSON 中 images 数组的顺序逐个消费。
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"message content must be str, got {type(text)}")
+
+    parts = text.split(IMAGE_TOKEN)
+    content: List[Dict[str, str]] = []
+    used_paths: List[str] = []
 
     for i, part in enumerate(parts):
+        if i > 0:
+            if image_ptr + len(used_paths) >= len(image_paths):
+                raise ValueError(
+                    f"Not enough images for message: {text!r}. image_ptr={image_ptr}, total_images={len(image_paths)}"
+                )
+            content.append({"type": "image"})
+            used_paths.append(image_paths[image_ptr + len(used_paths)])
+
         if part:
             content.append({"type": "text", "text": part})
-        if i < len(parts) - 1:
-            content.append({"type": "image"})
-            image_count += 1
 
     if not content:
+        # 纯空串时兜底；纯 <image> 则上面已经有 image block 了
         content = [{"type": "text", "text": ""}]
-    return content, image_count
+
+    return content, used_paths
 
 
-def norm_image_path(image_root: str, image_path: str) -> str:
-    if os.path.isabs(image_path):
-        return image_path
-    return os.path.join(image_root, image_path)
+
+def normalize_image_paths(raw_paths: Sequence[str], image_root: str) -> List[str]:
+    result = []
+    for p in raw_paths:
+        if os.path.isabs(p):
+            result.append(p)
+        else:
+            result.append(os.path.join(image_root, p))
+    return result
 
 
-class MllmSFTDataset(Dataset):
-    def __init__(self, data_cfg: dict[str, Any], processor: AutoProcessor):
-        raw = load_dataset(
-            data_cfg["path"],
-            data_files=data_cfg["data_files"],
-            split=data_cfg.get("split", "train"),
-        )
-        max_samples = data_cfg.get("max_samples")
-        if max_samples:
-            raw = raw.select(range(min(int(max_samples), len(raw))))
 
-        self.image_root = data_cfg["image_root"]
-        self.image_token = data_cfg.get("image_token", "<image>")
-        self.examples: list[dict[str, Any]] = []
+def build_sft_samples(records: List[Dict[str, Any]], image_root: str) -> List[Dict[str, Any]]:
+    """
+    最简单的做法：把每个 assistant 回复都展开成一个训练样本。
+    即：history(到当前 user 为止) -> 当前 assistant answer。
+    这样最容易做 label mask。
+    """
+    samples: List[Dict[str, Any]] = []
 
-        for item in raw:
-            self.examples.extend(self.flatten_item(item, processor))
+    for record_idx, record in enumerate(records):
+        messages = record.get("messages", [])
+        raw_images = record.get("images", [])
+        image_paths = normalize_image_paths(raw_images, image_root)
 
-    def flatten_item(self, item: dict[str, Any], processor: AutoProcessor) -> list[dict[str, Any]]:
-        image_list = item.get("images")
-        if image_list is None and item.get("image") is not None:
-            image_list = [item["image"]]
-        image_list = image_list or []
-        image_list = [norm_image_path(self.image_root, p) for p in image_list]
+        history_messages: List[Dict[str, Any]] = []
+        history_image_paths: List[str] = []
+        image_ptr = 0
 
-        history: list[dict[str, Any]] = []
-        used_image_num = 0
-        out: list[dict[str, Any]] = []
-
-        for msg in item["messages"]:
-            content, n_img = split_mm_text(msg.get("content"), self.image_token)
+        for turn_idx, msg in enumerate(messages):
             role = msg["role"]
-            history.append({"role": role, "content": content})
-            used_image_num += n_img
+            text = msg["content"]
 
-            if used_image_num > len(image_list):
-                raise ValueError(f"图片数量不够：需要 {used_image_num} 张，但只给了 {len(image_list)} 张。")
+            if role == "user":
+                content, used_images = split_text_and_collect_images(text, image_paths, image_ptr)
+                history_messages.append({"role": "user", "content": content})
+                history_image_paths.extend(used_images)
+                image_ptr += len(used_images)
 
-            if role != "assistant":
-                continue
-            if not history[:-1]:
-                continue
+            elif role == "assistant":
+                samples.append(
+                    {
+                        "conversation": deepcopy(history_messages),
+                        "answer": text,
+                        "image_paths": list(history_image_paths),
+                        "record_idx": record_idx,
+                        "turn_idx": turn_idx,
+                    }
+                )
+                history_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": text}],
+                    }
+                )
+            else:
+                raise ValueError(f"Unsupported role: {role}")
 
-            prompt_text = processor.apply_chat_template(
-                history[:-1],
-                tokenize=False,
-                add_generation_prompt=True,
+        if image_ptr != len(image_paths):
+            raise ValueError(
+                f"Unused images found in record {record_idx}: consumed={image_ptr}, total={len(image_paths)}"
             )
-            full_text = processor.apply_chat_template(
-                history,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            out.append(
-                {
-                    "prompt_text": prompt_text,
-                    "full_text": full_text,
-                    "image_paths": image_list[:used_image_num],
-                }
-            )
-        return out
+
+    return samples
+
+
+class JsonLlavaSFTDataset(Dataset):
+    def __init__(self, json_path: str, image_root: str):
+        super().__init__()
+        with open(json_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+
+        if not isinstance(records, list):
+            raise ValueError("JSON root must be a list")
+
+        self.samples = build_sft_samples(records, image_root)
 
     def __len__(self) -> int:
-        return len(self.examples)
+        return len(self.samples)
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        return self.examples[idx]
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        return self.samples[index]
 
 
 class LlavaSFTCollator:
     def __init__(self, processor: AutoProcessor, max_length: int):
         self.processor = processor
+        self.tokenizer = processor.tokenizer
         self.max_length = max_length
 
-    def load_images(self, image_paths: list[str]) -> list[Image.Image]:
-        images = []
-        for path in image_paths:
-            with Image.open(path) as img:
-                images.append(img.convert("RGB"))
-        return images
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "right"
 
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        if len(features) != 1:
-            raise ValueError(
-                "这个极简版默认按多图样本来写，建议 per_device_train_batch_size=1。"
-            )
+        self.image_token_id = getattr(processor, "image_token_id", None)
+        self.num_image_tokens_per_image = self._get_num_image_tokens_per_image()
 
-        feature = features[0]
-        images = self.load_images(feature["image_paths"])
-        images = images if images else None
+    def _get_num_image_tokens_per_image(self) -> Optional[int]:
+        if not hasattr(self.processor, "patch_size"):
+            return None
 
-        prompt_inputs = self.processor(
-            text=feature["prompt_text"],
-            images=images,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
+        crop_size = self.processor.image_processor.crop_size
+        if isinstance(crop_size, dict):
+            height = crop_size["height"]
+            width = crop_size["width"]
+        elif isinstance(crop_size, (tuple, list)):
+            height, width = crop_size
+        else:
+            height = width = int(crop_size)
+
+        patch_size = int(self.processor.patch_size)
+        num = (height // patch_size) * (width // patch_size) + int(self.processor.num_additional_image_tokens)
+        if getattr(self.processor, "vision_feature_select_strategy", None) == "default":
+            num -= 1
+        return num
+
+    def _build_prompt_text(self, conversation: List[Dict[str, Any]]) -> str:
+        prompt_text = self.processor.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
         )
+        if not prompt_text.endswith((" ", "\n")):
+            prompt_text += " "
+        return prompt_text
+
+    def _encode_one(self, sample: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        images = [load_image(p) for p in sample["image_paths"]]
+        prompt_text = self._build_prompt_text(sample["conversation"])
+        full_text = prompt_text + sample["answer"] + self.tokenizer.eos_token
+
+        processor_kwargs = {
+            "return_tensors": "pt",
+            "padding": False,
+            "truncation": True,
+            "max_length": self.max_length,
+        }
+
         full_inputs = self.processor(
-            text=feature["full_text"],
-            images=images,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
+            text=full_text,
+            images=images if len(images) > 0 else None,
+            **processor_kwargs,
+        )
+        prompt_inputs = self.processor(
+            text=prompt_text,
+            images=images if len(images) > 0 else None,
+            **processor_kwargs,
         )
 
-        labels = full_inputs["input_ids"].clone()
+        input_ids = full_inputs["input_ids"][0]
+        attention_mask = full_inputs["attention_mask"][0]
+        labels = input_ids.clone()
         prompt_len = prompt_inputs["input_ids"].shape[1]
-        prompt_len = min(prompt_len, labels.shape[1])
-        labels[:, :prompt_len] = -100
-        full_inputs["labels"] = labels
-        return full_inputs
+        labels[:prompt_len] = -100
+        labels[attention_mask == 0] = -100
+
+        # 避免 max_length 截断掉 image placeholder 导致 embeddings merge 报错
+        if len(images) > 0 and self.image_token_id is not None and self.num_image_tokens_per_image is not None:
+            num_image_tokens = int((input_ids == self.image_token_id).sum().item())
+            expected = len(images) * self.num_image_tokens_per_image
+            if num_image_tokens != expected:
+                raise ValueError(
+                    f"Image tokens are truncated or mismatched: got={num_image_tokens}, expected={expected}. "
+                    f"Please increase data.max_length. record_idx={sample['record_idx']}, turn_idx={sample['turn_idx']}"
+                )
+
+        out = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+        if "pixel_values" in full_inputs:
+            out["pixel_values"] = full_inputs["pixel_values"]
+
+        if "image_sizes" in full_inputs:
+            out["image_sizes"] = full_inputs["image_sizes"]
+
+        return out
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        encoded = [self._encode_one(x) for x in batch]
+        max_len = max(x["input_ids"].shape[0] for x in encoded)
+        pad_id = self.tokenizer.pad_token_id
+
+        input_ids_list = []
+        attention_mask_list = []
+        labels_list = []
+        pixel_values_list = []
+        image_sizes_list = []
+
+        for item in encoded:
+            pad_len = max_len - item["input_ids"].shape[0]
+            input_ids_list.append(F.pad(item["input_ids"], (0, pad_len), value=pad_id))
+            attention_mask_list.append(F.pad(item["attention_mask"], (0, pad_len), value=0))
+            labels_list.append(F.pad(item["labels"], (0, pad_len), value=-100))
+
+            if "pixel_values" in item:
+                pixel_values_list.append(item["pixel_values"])
+            if "image_sizes" in item:
+                image_sizes_list.append(item["image_sizes"])
+
+        output = {
+            "input_ids": torch.stack(input_ids_list, dim=0),
+            "attention_mask": torch.stack(attention_mask_list, dim=0),
+            "labels": torch.stack(labels_list, dim=0),
+        }
+
+        # LLaVA HF 在多图/多样本时可以直接把所有图按 batch 顺序拼起来，
+        # 文本中的 <image> placeholder 会按同样顺序消费这些图像特征。
+        if pixel_values_list:
+            output["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+        if image_sizes_list:
+            output["image_sizes"] = torch.cat(image_sizes_list, dim=0)
+
+        return output
 
 
-def load_model_and_processor(model_cfg: dict[str, Any]) -> tuple[LlavaForConditionalGeneration, AutoProcessor]:
-    dtype = get_dtype(model_cfg.get("torch_dtype", "bfloat16"))
+class LlavaLitModule(L.LightningModule):
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__()
+        self.cfg = cfg
 
-    model = LlavaForConditionalGeneration.from_pretrained(
-        model_cfg["name_or_path"],
-        torch_dtype=dtype,
-        attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
-        low_cpu_mem_usage=True,
-    )
-    processor = AutoProcessor.from_pretrained(model_cfg["name_or_path"])
+        model_cfg = cfg["model"]
+        train_cfg = cfg["train"]
+        lora_cfg = cfg["lora"]
+        data_cfg = cfg["data"]
 
-    if processor.tokenizer.pad_token is None:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
-    processor.tokenizer.padding_side = "right"
-    processor.tokenizer.truncation_side = "left"
+        dtype = get_torch_dtype(model_cfg["torch_dtype"])
 
-    if hasattr(processor, "image_processor"):
-        processor.image_processor.do_pad = bool(model_cfg.get("do_pad", True))
+        model_kwargs = {
+            "torch_dtype": dtype,
+            "low_cpu_mem_usage": True,
+        }
+        if model_cfg.get("attn_implementation"):
+            model_kwargs["attn_implementation"] = model_cfg["attn_implementation"]
 
-    if getattr(processor, "patch_size", None) is None and hasattr(model.config.vision_config, "patch_size"):
-        processor.patch_size = model.config.vision_config.patch_size
-    if getattr(processor, "vision_feature_select_strategy", None) is None and hasattr(model.config, "vision_feature_select_strategy"):
-        processor.vision_feature_select_strategy = model.config.vision_feature_select_strategy
-    if getattr(processor, "num_additional_image_tokens", None) is None:
-        processor.num_additional_image_tokens = int(model_cfg.get("num_additional_image_tokens", 1))
-
-    if model_cfg.get("gradient_checkpointing", True):
-        model.gradient_checkpointing_enable()
-        model.config.use_cache = False
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-
-    if model_cfg.get("use_lora", True):
-        if LoraConfig is None or get_peft_model is None:
-            raise ImportError("use_lora=true 但环境里没有安装 peft。")
-        lora_cfg = LoraConfig(
-            r=int(model_cfg.get("lora_r", 64)),
-            lora_alpha=int(model_cfg.get("lora_alpha", 128)),
-            lora_dropout=float(model_cfg.get("lora_dropout", 0.05)),
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=model_cfg.get(
-                "lora_target",
-                ".*language_model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
-            ),
+        self.processor = AutoProcessor.from_pretrained(model_cfg["name_or_path"], use_fast=False)
+        self.model = LlavaForConditionalGeneration.from_pretrained(
+            model_cfg["name_or_path"],
+            **model_kwargs,
         )
-        model = get_peft_model(model, lora_cfg)
-        model.print_trainable_parameters()
 
-    return model, processor
+        # 按 HF 官方建议，把这几个属性补到 processor 上，避免 image token 展开告警/错误。
+        self.processor.patch_size = self.model.config.vision_config.patch_size
+        self.processor.vision_feature_select_strategy = self.model.config.vision_feature_select_strategy
+        self.processor.num_additional_image_tokens = 1  # CLIP vision backbone 含 CLS token
+
+        if self.processor.tokenizer.pad_token_id is None:
+            self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
+        self.processor.tokenizer.padding_side = "right"
+        self.processor.tokenizer.model_max_length = int(data_cfg["max_length"])
+
+        self.model.config.use_cache = False
+
+        if model_cfg.get("gradient_checkpointing", False):
+            self.model.gradient_checkpointing_enable()
+            self.model.enable_input_require_grads()
+
+        # 先全冻结，再只在 language_model 上打 LoRA
+        freeze_all_parameters(self.model)
+        freeze_module(self.model.model.vision_tower)
+        freeze_module(self.model.model.multi_modal_projector)
+
+        auto_target_regex, auto_leaf_names = build_lm_target_regex(self.model)
+        target_modules = lora_cfg.get("target_modules_regex") or auto_target_regex
+
+        self.peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=int(lora_cfg["r"]),
+            lora_alpha=int(lora_cfg["alpha"]),
+            lora_dropout=float(lora_cfg["dropout"]),
+            bias=lora_cfg.get("bias", "none"),
+            target_modules=target_modules,
+        )
+        self.model = get_peft_model(self.model, self.peft_config)
+        assert_only_lora_trainable(self.model)
+
+        print(f"[LoRA] auto leaf names under language model: {auto_leaf_names}")
+        print(f"[LoRA] target_modules regex: {target_modules}")
+        self.model.print_trainable_parameters()
+
+        num_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        if num_trainable == 0:
+            raise RuntimeError("No trainable parameters found after applying LoRA")
+
+        self.learning_rate = float(train_cfg["lr"])
+        self.weight_decay = float(train_cfg.get("weight_decay", 0.0))
+        self.adam_beta1 = float(train_cfg.get("adam_beta1", 0.9))
+        self.adam_beta2 = float(train_cfg.get("adam_beta2", 0.999))
+        self.adam_eps = float(train_cfg.get("adam_eps", 1e-8))
+
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        outputs = self.model(**batch)
+        loss = outputs.loss
+        self.log(
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            batch_size=batch["input_ids"].size(0),
+            sync_dist=self.trainer.world_size > 1,
+        )
+        return loss
+
+    def configure_optimizers(self):
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.learning_rate,
+            betas=(self.adam_beta1, self.adam_beta2),
+            eps=self.adam_eps,
+            weight_decay=self.weight_decay,
+        )
+        return optimizer
+
+    def save_adapter(self, output_dir: str) -> None:
+        os.makedirs(output_dir, exist_ok=True)
+        self.model.save_pretrained(output_dir)
+        self.processor.save_pretrained(output_dir)
 
 
-def build_training_args(cfg: dict[str, Any]) -> TrainingArguments:
-    train_cfg = cfg["train"]
-    model_cfg = cfg["model"]
 
-    kwargs = dict(
-        output_dir=train_cfg["output_dir"],
-        per_device_train_batch_size=int(train_cfg.get("per_device_train_batch_size", 1)),
-        gradient_accumulation_steps=int(train_cfg.get("gradient_accumulation_steps", 1)),
-        learning_rate=float(train_cfg.get("learning_rate", 2e-5)),
-        num_train_epochs=float(train_cfg.get("num_train_epochs", 1)),
-        warmup_ratio=float(train_cfg.get("warmup_ratio", 0.03)),
-        lr_scheduler_type=train_cfg.get("lr_scheduler_type", "cosine"),
-        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
-        logging_steps=int(train_cfg.get("logging_steps", 10)),
-        save_steps=int(train_cfg.get("save_steps", 500)),
-        save_total_limit=int(train_cfg.get("save_total_limit", 2)),
-        dataloader_num_workers=int(train_cfg.get("dataloader_num_workers", 4)),
-        bf16=bool(train_cfg.get("bf16", False)),
-        fp16=bool(train_cfg.get("fp16", False)),
-        tf32=bool(train_cfg.get("tf32", True)),
-        report_to=train_cfg.get("report_to", "none"),
-        remove_unused_columns=False,
-        logging_first_step=True,
-        ddp_find_unused_parameters=bool(train_cfg.get("ddp_find_unused_parameters", False)),
-        save_strategy="steps",
-        eval_strategy="no",
-        optim=train_cfg.get("optim", "adamw_torch"),
-        gradient_checkpointing=bool(model_cfg.get("gradient_checkpointing", True)),
-        deepspeed=train_cfg.get("deepspeed"),
+def build_dataloader(cfg: Dict[str, Any], processor: AutoProcessor) -> Tuple[Dataset, DataLoader]:
+    data_cfg = cfg["data"]
+    loader_cfg = cfg["loader"]
+
+    if data_cfg.get("path") != "json":
+        raise ValueError("This minimal example only supports data.path == 'json'")
+
+    dataset = JsonLlavaSFTDataset(
+        json_path=data_cfg["data_files"],
+        image_root=data_cfg["image_root"],
+    )
+    collator = LlavaSFTCollator(
+        processor=processor,
+        max_length=int(data_cfg["max_length"]),
     )
 
-    if train_cfg.get("max_steps") is not None:
-        kwargs["max_steps"] = int(train_cfg["max_steps"])
+    num_workers = int(loader_cfg.get("num_workers", 0))
+    dataloader = DataLoader(
+        dataset,
+        batch_size=int(loader_cfg["batch_size"]),
+        shuffle=bool(loader_cfg.get("shuffle", True)),
+        num_workers=num_workers,
+        pin_memory=bool(loader_cfg.get("pin_memory", True)),
+        persistent_workers=bool(loader_cfg.get("persistent_workers", False)) if num_workers > 0 else False,
+        collate_fn=collator,
+        drop_last=bool(loader_cfg.get("drop_last", False)),
+    )
+    return dataset, dataloader
 
-    try:
-        return TrainingArguments(**kwargs)
-    except TypeError:
-        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
-        return TrainingArguments(**kwargs)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    return parser.parse_args()
+
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    args = parser.parse_args()
-
+    args = parse_args()
     cfg = load_yaml(args.config)
-    model, processor = load_model_and_processor(cfg["model"])
-    dataset = MllmSFTDataset(cfg["data"], processor)
-    print(f"train examples: {len(dataset)}")
-    collator = LlavaSFTCollator(processor, int(cfg["data"].get("max_length", 2048)))
-    training_args = build_training_args(cfg)
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        data_collator=collator,
+    output_dir = cfg["train"]["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+    save_yaml(cfg, os.path.join(output_dir, "used_config.yaml"))
+
+    seed = int(cfg.get("seed", 42))
+    L.seed_everything(seed, workers=True)
+
+    lit_model = LlavaLitModule(cfg)
+    dataset, train_loader = build_dataloader(cfg, lit_model.processor)
+
+    if len(dataset) == 0:
+        raise RuntimeError("No training samples found")
+
+    logger = CSVLogger(save_dir=output_dir, name="csv_logs")
+
+    callbacks = [LearningRateMonitor(logging_interval="step")]
+    if cfg["trainer"].get("save_lightning_ckpt", False):
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=os.path.join(output_dir, "lightning_ckpt"),
+                filename="epoch{epoch:02d}-step{step}",
+                save_last=True,
+                save_top_k=-1,
+                every_n_epochs=1,
+            )
+        )
+
+    trainer = L.Trainer(
+        accelerator=cfg["trainer"].get("accelerator", "gpu"),
+        devices=cfg["trainer"].get("devices", 1),
+        num_nodes=cfg["trainer"].get("num_nodes", 1),
+        strategy=cfg["trainer"].get("strategy", "auto"),
+        precision=cfg["trainer"].get("precision", "16-mixed"),
+        max_epochs=int(cfg["trainer"].get("max_epochs", 1)),
+        accumulate_grad_batches=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
+        gradient_clip_val=float(cfg["trainer"].get("gradient_clip_val", 1.0)),
+        log_every_n_steps=int(cfg["trainer"].get("log_every_n_steps", 1)),
+        default_root_dir=output_dir,
+        logger=logger,
+        callbacks=callbacks,
+        enable_checkpointing=bool(cfg["trainer"].get("save_lightning_ckpt", False)),
+        num_sanity_val_steps=0,
     )
 
-    trainer.train(resume_from_checkpoint=cfg["train"].get("resume_from_checkpoint"))
-    trainer.save_model()
-    processor.save_pretrained(cfg["train"]["output_dir"])
+    print(f"[Data] num training samples: {len(dataset)}")
+    trainer.fit(lit_model, train_dataloaders=train_loader)
+
+    if trainer.is_global_zero:
+        adapter_dir = os.path.join(output_dir, "adapter")
+        lit_model.save_adapter(adapter_dir)
+        shutil.copy2(args.config, os.path.join(output_dir, "train_config.yaml"))
+        print(f"[Save] LoRA adapter saved to: {adapter_dir}")
 
 
 if __name__ == "__main__":
