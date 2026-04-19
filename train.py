@@ -347,14 +347,20 @@ def main() -> None:
         pad_to_multiple_of=cfg.get("train", {}).get("pad_to_multiple_of"),
     )
 
-    trainer = Trainer(
-        model=model,
-        args=train_args,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        data_collator=collator,
-        tokenizer=tokenizer,
-    )
+    trainer_kwargs = {
+        "model": model,
+        "args": train_args,
+        "train_dataset": train_ds,
+        "eval_dataset": eval_ds,
+        "data_collator": collator,
+    }
+    trainer_init_params = inspect.signature(Trainer.__init__).parameters
+    if "processing_class" in trainer_init_params:
+        trainer_kwargs["processing_class"] = processor
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    trainer = Trainer(**trainer_kwargs)
     trainer.train(resume_from_checkpoint=cfg.get("train", {}).get("resume_from_checkpoint"))
 
     if getattr(train_args, "save_model_at_end", False):
