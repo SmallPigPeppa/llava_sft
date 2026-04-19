@@ -1,7 +1,3 @@
-# Minimal version of train_llava15_lora_demo_2k.sh.
-# Run:
-#   WANDB_API_KEY=... python train.py --config configs/demo2k.yaml
-
 seed: 42
 wandb_project: CL-debug
 
