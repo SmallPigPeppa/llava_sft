@@ -117,6 +117,7 @@ def load_vision_language_model(model_cfg: dict[str, Any]):
     model_kwargs: dict[str, Any] = {
         "trust_remote_code": trust_remote_code,
         "torch_dtype": resolve_torch_dtype(model_cfg.get("torch_dtype", "bfloat16")),
+        "use_cache": False,
     }
     if model_cfg.get("device_map") is not None:
         model_kwargs["device_map"] = model_cfg["device_map"]
@@ -136,10 +137,14 @@ def load_vision_language_model(model_cfg: dict[str, Any]):
 
         model = LlavaForConditionalGeneration.from_pretrained(model_name, **model_kwargs)
 
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is not None and hasattr(generation_config, "use_cache"):
+        generation_config.use_cache = False
+
     if bool(model_cfg.get("gradient_checkpointing", False)):
         model.gradient_checkpointing_enable()
-        if hasattr(model.config, "use_cache"):
-            model.config.use_cache = False
 
     return model, processor, tokenizer
 
