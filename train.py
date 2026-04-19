@@ -100,6 +100,28 @@ def apply_runtime_flags(train_cfg: dict[str, Any]) -> None:
     if hasattr(torch.backends.cudnn, "allow_tf32"):
         torch.backends.cudnn.allow_tf32 = tf32
 
+def set_use_cache(model: torch.nn.Module, value: bool = False) -> None:
+    """Set KV-cache flag on wrapper, inner language model, configs and generation_config."""
+    seen: set[int] = set()
+
+    def _set(obj: Any) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+
+        if hasattr(obj, "use_cache"):
+            obj.use_cache = value
+
+        for attr in ("config", "generation_config", "text_config", "language_config"):
+            _set(getattr(obj, attr, None))
+
+    _set(model)
+
+    # Cover nested modules such as model.language_model / base_model / PEFT wrapper.
+    for module in model.modules():
+        _set(getattr(module, "config", None))
+        _set(getattr(module, "generation_config", None))
+
 
 def load_vision_language_model(model_cfg: dict[str, Any]):
     """Load processor + LLaVA model while keeping imports compatible across Transformers versions."""
@@ -136,10 +158,19 @@ def load_vision_language_model(model_cfg: dict[str, Any]):
 
         model = LlavaForConditionalGeneration.from_pretrained(model_name, **model_kwargs)
 
+    # if bool(model_cfg.get("gradient_checkpointing", False)):
+    #     model.gradient_checkpointing_enable()
+    #     if hasattr(model.config, "use_cache"):
+    #         model.config.use_cache = False
+
+    # 训练默认不使用 KV cache；gradient checkpointing 下必须关闭。
+    if not bool(model_cfg.get("use_cache", False)):
+        set_use_cache(model, False)
+
     if bool(model_cfg.get("gradient_checkpointing", False)):
+        set_use_cache(model, False)  # must be before first forward
         model.gradient_checkpointing_enable()
-        if hasattr(model.config, "use_cache"):
-            model.config.use_cache = False
+        set_use_cache(model, False)  # cover nested configs again
 
     return model, processor, tokenizer
 
@@ -316,6 +347,9 @@ def main() -> None:
 
     model, processor, tokenizer = load_vision_language_model(cfg["model"])
     model = apply_lora(model, cfg.get("lora", {}))
+
+    if not bool(cfg["model"].get("use_cache", False)):
+        set_use_cache(model, False)
 
     data_cfg = cfg["data"]
     spec = read_dataset_spec(data_cfg)

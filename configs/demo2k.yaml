@@ -12,6 +12,7 @@ model:
   device_map: null
   load_in_4bit: false
   load_in_8bit: false
+  use_cache: false
 
 lora:
   enable: true
@@ -72,3 +73,4 @@ train:
   eval_steps: 500
   dataloader_num_workers: 4
   remove_unused_columns: false
+  use_cache: false
