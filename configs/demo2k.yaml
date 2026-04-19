@@ -7,8 +7,8 @@ model:
   torch_dtype: bfloat16
   padding_side: right
   gradient_checkpointing: true
-  attn_implementation: flash_attention_2
-#  attn_implementation: null
+#  attn_implementation: flash_attention_2
+  attn_implementation: null
   device_map: null
   load_in_4bit: false
   load_in_8bit: false
