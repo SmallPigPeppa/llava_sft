@@ -1,0 +1,76 @@
+# Minimal version of train_llava15_lora_demo_2k.sh.
+# Run:
+#   WANDB_API_KEY=... python train.py --config configs/demo2k.yaml
+
+seed: 42
+wandb_project: CL-debug
+
+model:
+  model_name_or_path: llava-hf/llava-1.5-7b-hf
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  padding_side: right
+  gradient_checkpointing: false
+  attn_implementation: null
+  device_map: null
+  load_in_4bit: false
+  load_in_8bit: false
+
+lora:
+  enable: true
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  bias: none
+  task_type: CAUSAL_LM
+  # "all" means all Linear layers outside vision tower / multimodal projector / lm_head.
+  target_modules: all
+  freeze_vision_tower: true
+  freeze_multi_modal_projector: true
+  prepare_kbit: false
+
+data:
+  # Must contain dataset_info.json. For demo2k this file defines demo_2000 -> /ppio_net0/datasets/parquet/llava_779k_demo_2000
+  dataset_dir: data/llava_779k_demo
+  dataset: demo_2000
+  template: llava
+  cutoff_len: 2048
+  max_samples: null
+  val_size: 0.001
+  seed: 42
+  image_token: "<image>"
+  # null = infer from processor/model, normally 576 for llava-1.5 336px CLIP features.
+  image_seq_len: null
+  add_default_system: true
+  train_on_prompt: false
+  media_dir: null
+  trust_remote_code: false
+
+train:
+  output_dir: saves/llava-1.5-7b/lora/llava-779k-demo-2k
+  run_name: llava15-lora-779k-demo-2k
+  overwrite_output_dir: true
+
+  # User requirement: logs go to W&B, no checkpoints are saved.
+  report_to: [wandb]
+  save_checkpoint: false
+  save_strategy: "no"
+  save_model_at_end: false
+
+  logging_steps: 10
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  num_train_epochs: 1.0
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  bf16: true
+  fp16: false
+  ddp_timeout: 180000000
+  resume_from_checkpoint: null
+
+  per_device_eval_batch_size: 1
+  eval_strategy: steps
+  eval_steps: 500
+  dataloader_num_workers: 4
+  remove_unused_columns: false

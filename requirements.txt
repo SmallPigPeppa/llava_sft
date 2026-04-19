@@ -1,8 +1,9 @@
 torch
-transformers>=4.49.0
-datasets
+transformers>=4.46.0
 accelerate
-lightning
-peft
-PyYAML
-Pillow
+peft>=0.10.0
+datasets
+pillow
+pyyaml
+wandb
+pyarrow

@@ -1,550 +1,368 @@
+#!/usr/bin/env python3
+"""Minimal Hugging Face Trainer script for LLaVA LoRA SFT.
+
+Example:
+    WANDB_PROJECT=CL-debug python train.py --config configs/demo2k.yaml
+    python train.py --config configs/demo2k.yaml train.num_train_epochs=1 data.max_samples=64
+"""
+
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 from typing import Any
 
 import torch
 import yaml
-from datasets import load_dataset
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoProcessor, LlavaForConditionalGeneration, get_scheduler
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import AutoProcessor, Trainer, TrainingArguments, set_seed
 
-try:
-    import lightning as L
-    from lightning.pytorch.callbacks import ModelCheckpoint
-    from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
-    from lightning.pytorch.strategies import DDPStrategy, DeepSpeedStrategy
-except Exception:
-    import pytorch_lightning as L
-    from pytorch_lightning.callbacks import ModelCheckpoint
-    from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
-    from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
+from data import IGNORE_INDEX, ShareGPTLlavaDataset, load_raw_dataset, read_dataset_spec, split_train_eval
 
-try:
-    from peft import LoraConfig, get_peft_model
-except Exception:
-    LoraConfig = None
-    get_peft_model = None
+
+EXCLUDE_LORA_KEYWORDS = (
+    "vision_tower",
+    "vision_model",
+    "visual",
+    "multi_modal_projector",
+    "mm_projector",
+    "projector",
+    "lm_head",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config.")
+    parser.add_argument(
+        "overrides",
+        nargs="*",
+        help="Optional dot-list overrides, e.g. train.learning_rate=1e-4 data.max_samples=128",
+    )
+    return parser.parse_args()
 
 
 def load_yaml(path: str) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 
-def get_dtype(name: str) -> torch.dtype:
-    name = str(name).lower()
-    if name in {"fp16", "float16", "half"}:
-        return torch.float16
-    if name in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    return torch.float32
+def parse_value(value: str) -> Any:
+    lowered = value.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"null", "none"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
 
 
-def split_mm_text(text: Any, image_token: str) -> tuple[list[dict[str, str]], int]:
-    if isinstance(text, list):
-        image_count = 0
-        for x in text:
-            if isinstance(x, dict) and x.get("type") == "image":
-                image_count += 1
-        return text, image_count
-
-    text = "" if text is None else str(text)
-    parts = text.split(image_token)
-    content: list[dict[str, str]] = []
-    image_count = 0
-
-    for i, part in enumerate(parts):
-        if part:
-            content.append({"type": "text", "text": part})
-        if i < len(parts) - 1:
-            content.append({"type": "image"})
-            image_count += 1
-
-    if not content:
-        content = [{"type": "text", "text": ""}]
-    return content, image_count
+def apply_overrides(cfg: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"Override must be key=value, got: {item}")
+        key, raw_value = item.split("=", 1)
+        cursor = cfg
+        parts = key.split(".")
+        for part in parts[:-1]:
+            cursor = cursor.setdefault(part, {})
+        cursor[parts[-1]] = parse_value(raw_value)
+    return cfg
 
 
-def norm_image_path(image_root: str, image_path: str) -> str:
-    if os.path.isabs(image_path):
-        return image_path
-    return os.path.join(image_root, image_path)
+def resolve_torch_dtype(name: Any):
+    if name is None or name == "auto":
+        return "auto"
+    if isinstance(name, torch.dtype):
+        return name
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    return mapping[str(name).lower()]
 
 
-class MllmSFTDataset(Dataset):
-    def __init__(self, data_cfg: dict[str, Any], processor: AutoProcessor):
-        raw = load_dataset(
-            data_cfg["path"],
-            data_files=data_cfg["data_files"],
-            split=data_cfg.get("split", "train"),
-        )
-        max_samples = data_cfg.get("max_samples")
-        if max_samples:
-            raw = raw.select(range(min(int(max_samples), len(raw))))
+def load_vision_language_model(model_cfg: dict[str, Any]):
+    """Load processor + LLaVA model while keeping imports compatible across Transformers versions."""
+    model_name = model_cfg["model_name_or_path"]
+    trust_remote_code = bool(model_cfg.get("trust_remote_code", True))
 
-        self.image_root = data_cfg["image_root"]
-        self.image_token = data_cfg.get("image_token", "<image>")
-        self.examples: list[dict[str, Any]] = []
+    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("AutoProcessor has no tokenizer; this script expects a LLaVA-style processor.")
+    tokenizer.padding_side = str(model_cfg.get("padding_side", "right"))
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-        for item in raw:
-            self.examples.extend(self.flatten_item(item, processor))
+    model_kwargs: dict[str, Any] = {
+        "trust_remote_code": trust_remote_code,
+        "torch_dtype": resolve_torch_dtype(model_cfg.get("torch_dtype", "bfloat16")),
+    }
+    if model_cfg.get("device_map") is not None:
+        model_kwargs["device_map"] = model_cfg["device_map"]
+    if model_cfg.get("attn_implementation") is not None:
+        model_kwargs["attn_implementation"] = model_cfg["attn_implementation"]
+    if model_cfg.get("load_in_4bit"):
+        model_kwargs["load_in_4bit"] = True
+    if model_cfg.get("load_in_8bit"):
+        model_kwargs["load_in_8bit"] = True
 
-    def flatten_item(self, item: dict[str, Any], processor: AutoProcessor) -> list[dict[str, Any]]:
-        image_list = item.get("images")
-        if image_list is None and item.get("image") is not None:
-            image_list = [item["image"]]
-        image_list = image_list or []
-        image_list = [norm_image_path(self.image_root, p) for p in image_list]
+    try:
+        from transformers import AutoModelForVision2Seq
 
-        history: list[dict[str, Any]] = []
-        used_image_num = 0
-        out: list[dict[str, Any]] = []
+        model = AutoModelForVision2Seq.from_pretrained(model_name, **model_kwargs)
+    except Exception:
+        from transformers import LlavaForConditionalGeneration
 
-        for msg in item["messages"]:
-            content, n_img = split_mm_text(msg.get("content"), self.image_token)
-            role = msg["role"]
-            history.append({"role": role, "content": content})
-            used_image_num += n_img
+        model = LlavaForConditionalGeneration.from_pretrained(model_name, **model_kwargs)
 
-            if used_image_num > len(image_list):
-                raise ValueError(f"图片数量不够：需要 {used_image_num} 张，但只给了 {len(image_list)} 张。")
+    if bool(model_cfg.get("gradient_checkpointing", False)):
+        model.gradient_checkpointing_enable()
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
 
-            if role != "assistant":
-                continue
-            if not history[:-1]:
-                continue
-
-            prompt_text = processor.apply_chat_template(
-                history[:-1],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            full_text = processor.apply_chat_template(
-                history,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            out.append(
-                {
-                    "prompt_text": prompt_text,
-                    "full_text": full_text,
-                    "image_paths": image_list[:used_image_num],
-                }
-            )
-        return out
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        return self.examples[idx]
+    return model, processor, tokenizer
 
 
-class LlavaSFTCollator:
-    def __init__(self, processor: AutoProcessor, max_length: int):
+def freeze_by_keywords(model: torch.nn.Module, keywords: tuple[str, ...]) -> None:
+    for name, param in model.named_parameters():
+        if any(key in name for key in keywords):
+            param.requires_grad = False
+
+
+def find_linear_lora_targets(model: torch.nn.Module, exclude_keywords: tuple[str, ...] = EXCLUDE_LORA_KEYWORDS) -> list[str]:
+    """Return full Linear module names outside vision tower/projector/lm_head.
+
+    Full names are used instead of suffixes so PEFT does not accidentally inject LoRA into
+    vision modules with the same names, such as q_proj/v_proj.
+    """
+    targets: list[str] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if any(key in name for key in exclude_keywords):
+            continue
+        targets.append(name)
+    if not targets:
+        raise ValueError("No Linear modules found for LoRA. Set lora.target_modules explicitly in YAML.")
+    return targets
+
+
+def apply_lora(model: torch.nn.Module, lora_cfg: dict[str, Any]) -> torch.nn.Module:
+    if not bool(lora_cfg.get("enable", True)):
+        return model
+
+    target_modules = lora_cfg.get("target_modules", "all")
+    if target_modules in {"all", "all-linear", "all_linear"}:
+        target_modules = find_linear_lora_targets(model)
+    elif isinstance(target_modules, str):
+        target_modules = [x.strip() for x in target_modules.split(",") if x.strip()]
+
+    if lora_cfg.get("freeze_vision_tower", True):
+        freeze_by_keywords(model, ("vision_tower", "vision_model", "visual"))
+    if lora_cfg.get("freeze_multi_modal_projector", True):
+        freeze_by_keywords(model, ("multi_modal_projector", "mm_projector", "projector"))
+
+    if lora_cfg.get("prepare_kbit", False):
+        model = prepare_model_for_kbit_training(model)
+
+    peft_config = LoraConfig(
+        r=int(lora_cfg.get("r", 8)),
+        lora_alpha=int(lora_cfg.get("alpha", 16)),
+        lora_dropout=float(lora_cfg.get("dropout", 0.05)),
+        bias=str(lora_cfg.get("bias", "none")),
+        task_type=str(lora_cfg.get("task_type", "CAUSAL_LM")),
+        target_modules=target_modules,
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+    return model
+
+
+def infer_image_seq_len(processor, model, data_cfg: dict[str, Any]) -> int:
+    if data_cfg.get("image_seq_len") is not None:
+        return int(data_cfg["image_seq_len"])
+
+    image_processor = getattr(processor, "image_processor", None)
+    crop_size = getattr(image_processor, "crop_size", None) or {}
+    size = getattr(image_processor, "size", None) or {}
+
+    height = crop_size.get("height") or size.get("height") or size.get("shortest_edge") or 336
+    width = crop_size.get("width") or size.get("width") or size.get("shortest_edge") or 336
+
+    patch_size = getattr(processor, "patch_size", None)
+    if patch_size is None:
+        vision_cfg = getattr(getattr(model, "config", None), "vision_config", None)
+        patch_size = getattr(vision_cfg, "patch_size", 14)
+
+    additional = getattr(processor, "num_additional_image_tokens", None)
+    if additional is None:
+        additional = 1
+
+    strategy = getattr(processor, "vision_feature_select_strategy", None)
+    if strategy is None:
+        strategy = getattr(getattr(model, "config", None), "vision_feature_select_strategy", "default")
+
+    seq_len = (int(height) // int(patch_size)) * (int(width) // int(patch_size)) + int(additional)
+    if strategy == "default":
+        seq_len -= 1
+    return int(seq_len)
+
+
+class LlavaDataCollator:
+    """Pad text labels and build image tensors through the HF image processor."""
+
+    def __init__(self, tokenizer, processor, pad_to_multiple_of: int | None = None) -> None:
+        self.tokenizer = tokenizer
         self.processor = processor
-        self.max_length = max_length
+        self.pad_to_multiple_of = pad_to_multiple_of
 
-    def load_images(self, image_paths: list[str]) -> list[Image.Image]:
-        images = []
-        for path in image_paths:
-            with Image.open(path) as img:
-                images.append(img.convert("RGB"))
-        return images
+    def _pad_labels(self, labels: list[list[int]], max_len: int) -> torch.Tensor:
+        padded = []
+        for row in labels:
+            pad_len = max_len - len(row)
+            if self.tokenizer.padding_side == "right":
+                padded.append(row + [IGNORE_INDEX] * pad_len)
+            else:
+                padded.append([IGNORE_INDEX] * pad_len + row)
+        return torch.tensor(padded, dtype=torch.long)
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        if len(features) != 1:
-            raise ValueError(
-                "这个极简版默认按多图样本来写，建议 per_device_train_batch_size=1。"
+        images = []
+        text_features = []
+        label_rows = []
+        for feature in features:
+            images.extend(feature.get("images") or [])
+            text_features.append(
+                {
+                    "input_ids": feature["input_ids"],
+                    "attention_mask": feature["attention_mask"],
+                }
             )
+            label_rows.append(feature["labels"])
 
-        feature = features[0]
-        images = self.load_images(feature["image_paths"])
-        images = images if images else None
-
-        prompt_inputs = self.processor(
-            text=feature["prompt_text"],
-            images=images,
+        batch = self.tokenizer.pad(
+            text_features,
+            padding=True,
+            pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
         )
-        full_inputs = self.processor(
-            text=feature["full_text"],
-            images=images,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
-        )
+        batch["labels"] = self._pad_labels(label_rows, max_len=batch["input_ids"].shape[1])
 
-        labels = full_inputs["input_ids"].clone()
-        prompt_len = prompt_inputs["input_ids"].shape[1]
-        prompt_len = min(prompt_len, labels.shape[1])
-        labels[:, :prompt_len] = -100
-        full_inputs["labels"] = labels
-        return full_inputs
+        if images:
+            image_inputs = self.processor.image_processor(images, return_tensors="pt")
+            batch.update(image_inputs)
+        return batch
 
 
-def load_model_and_processor(model_cfg: dict[str, Any]) -> tuple[LlavaForConditionalGeneration, AutoProcessor]:
-    dtype = get_dtype(model_cfg.get("torch_dtype", "bfloat16"))
+def build_training_args(train_cfg: dict[str, Any]) -> TrainingArguments:
+    cfg = dict(train_cfg)
 
-    model = LlavaForConditionalGeneration.from_pretrained(
-        model_cfg["name_or_path"],
-        torch_dtype=dtype,
-        attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
-        low_cpu_mem_usage=True,
-    )
-    processor = AutoProcessor.from_pretrained(model_cfg["name_or_path"])
+    # User requested: log to wandb, no checkpoints.
+    if cfg.get("save_checkpoint", False) is False:
+        cfg["save_strategy"] = "no"
+        cfg.pop("save_steps", None)
 
-    if processor.tokenizer.pad_token is None:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
-    processor.tokenizer.padding_side = "right"
-    processor.tokenizer.truncation_side = "left"
+    cfg.setdefault("remove_unused_columns", False)
+    cfg.setdefault("report_to", ["wandb"])
 
-    if hasattr(processor, "image_processor"):
-        processor.image_processor.do_pad = bool(model_cfg.get("do_pad", True))
+    # Compatibility between older/newer Transformers names.
+    sig = inspect.signature(TrainingArguments.__init__).parameters
+    if "eval_strategy" in cfg and "eval_strategy" not in sig and "evaluation_strategy" in sig:
+        cfg["evaluation_strategy"] = cfg.pop("eval_strategy")
+    if "evaluation_strategy" in cfg and "evaluation_strategy" not in sig and "eval_strategy" in sig:
+        cfg["eval_strategy"] = cfg.pop("evaluation_strategy")
 
-    if getattr(processor, "patch_size", None) is None and hasattr(model.config.vision_config, "patch_size"):
-        processor.patch_size = model.config.vision_config.patch_size
-    if getattr(processor, "vision_feature_select_strategy", None) is None and hasattr(model.config, "vision_feature_select_strategy"):
-        processor.vision_feature_select_strategy = model.config.vision_feature_select_strategy
-    if getattr(processor, "num_additional_image_tokens", None) is None:
-        processor.num_additional_image_tokens = int(model_cfg.get("num_additional_image_tokens", 1))
+    save_model_at_end = cfg.pop("save_model_at_end", False)
+    cfg["save_model_at_end"] = save_model_at_end  # reattached below as dynamic attribute
 
-    if model_cfg.get("gradient_checkpointing", True):
-        model.gradient_checkpointing_enable()
-        model.config.use_cache = False
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-
-    if model_cfg.get("use_lora", True):
-        if LoraConfig is None or get_peft_model is None:
-            raise ImportError("use_lora=true 但环境里没有安装 peft。")
-        lora_cfg = LoraConfig(
-            r=int(model_cfg.get("lora_r", 64)),
-            lora_alpha=int(model_cfg.get("lora_alpha", 128)),
-            lora_dropout=float(model_cfg.get("lora_dropout", 0.05)),
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=model_cfg.get(
-                "lora_target",
-                ".*language_model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
-            ),
-        )
-        model = get_peft_model(model, lora_cfg)
-        model.print_trainable_parameters()
-
-        if model_cfg.get("gradient_checkpointing", True):
-            if hasattr(model, "gradient_checkpointing_enable"):
-                try:
-                    model.gradient_checkpointing_enable(
-                        gradient_checkpointing_kwargs={"use_reentrant": True}
-                    )
-                except TypeError:
-                    model.gradient_checkpointing_enable()
-            if hasattr(model, "config"):
-                model.config.use_cache = False
-        model.print_trainable_parameters()
-
-    return model, processor
-
-
-def apply_runtime_flags(train_cfg: dict[str, Any]) -> None:
-    tf32 = bool(train_cfg.get("tf32", True))
-    if torch.cuda.is_available():
-        if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-            torch.backends.cuda.matmul.allow_tf32 = tf32
-        if hasattr(torch.backends.cudnn, "allow_tf32"):
-            torch.backends.cudnn.allow_tf32 = tf32
-
-
-def build_optimizer_param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict[str, Any]]:
-    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    if not trainable:
-        raise ValueError("没有可训练参数。")
-
-    if weight_decay <= 0:
-        return [{"params": [p for _, p in trainable], "weight_decay": 0.0}]
-
-    no_decay_keywords = ("bias", "norm", "layernorm", "layer_norm", "ln_")
-    decay_params = []
-    no_decay_params = []
-
-    for name, param in trainable:
-        lname = name.lower()
-        if any(key in lname for key in no_decay_keywords):
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
-
-    return [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-
-
-def resolve_precision(train_cfg: dict[str, Any], accelerator: str) -> str:
-    if accelerator != "gpu":
-        return "32-true"
-
-    use_bf16 = bool(train_cfg.get("bf16", False))
-    use_fp16 = bool(train_cfg.get("fp16", False))
-    if use_bf16 and use_fp16:
-        raise ValueError("bf16 和 fp16 不能同时为 true。")
-    if use_bf16:
-        return "bf16-mixed"
-    if use_fp16:
-        return "16-mixed"
-    return "32-true"
-
-
-def build_logger(train_cfg: dict[str, Any]):
-    report_to = train_cfg.get("report_to", "none")
-    if report_to is None:
-        return False
-
-    if isinstance(report_to, (list, tuple)):
-        targets = {str(x).lower() for x in report_to}
-    else:
-        targets = {str(report_to).lower()}
-
-    if not targets or targets == {"none"}:
-        return False
-
-    output_dir = train_cfg["output_dir"]
-    logging_steps = int(train_cfg.get("logging_steps", 10))
-
-    if "tensorboard" in targets or "tb" in targets:
-        return TensorBoardLogger(save_dir=output_dir, name="lightning_logs")
-
-    return CSVLogger(
-        save_dir=output_dir,
-        name="lightning_logs",
-        flush_logs_every_n_steps=logging_steps,
-    )
-
-
-def build_checkpoint_callback(train_cfg: dict[str, Any]) -> ModelCheckpoint:
-    save_total_limit = int(train_cfg.get("save_total_limit", 2))
-    save_steps = int(train_cfg.get("save_steps", 500))
-
-    return ModelCheckpoint(
-        dirpath=os.path.join(train_cfg["output_dir"], "checkpoints"),
-        filename="step={step}",
-        monitor="step",
-        mode="max",
-        save_top_k=save_total_limit,
-        save_last=True,
-        every_n_train_steps=save_steps,
-        save_on_train_epoch_end=False,
-        auto_insert_metric_name=False,
-    )
-
-
-def resolve_strategy(train_cfg: dict[str, Any]):
-    deepspeed_cfg = train_cfg.get("deepspeed")
-    if deepspeed_cfg:
-        return DeepSpeedStrategy(config=deepspeed_cfg)
-
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size > 1:
-        return DDPStrategy(
-            find_unused_parameters=bool(train_cfg.get("ddp_find_unused_parameters", False))
-        )
-    return "auto"
-
-
-def infer_devices_and_nodes(accelerator: str) -> tuple[int, int]:
-    if accelerator != "gpu":
-        return 1, 1
-
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size <= 1:
-        return 1, 1
-
-    local_world_size = os.environ.get("LOCAL_WORLD_SIZE")
-    if local_world_size is None:
-        local_world_size = str(max(torch.cuda.device_count(), 1))
-
-    devices = int(local_world_size)
-    num_nodes = max(world_size // max(devices, 1), 1)
-    return devices, num_nodes
-
-
-class LlavaLightningModule(L.LightningModule):
-    def __init__(self, cfg: dict[str, Any], model: LlavaForConditionalGeneration, processor: AutoProcessor):
-        super().__init__()
-        self.cfg = cfg
-        self.model = model
-        self.processor = processor
-        self.train_cfg = cfg["train"]
-        self.save_hyperparameters({"config": cfg}, logger=False)
-
-    def forward(self, **batch):
-        return self.model(**batch)
-
-    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        outputs = self.model(**batch)
-        loss = outputs.loss
-        self.log(
-            "train_loss",
-            loss,
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=False,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train_loss_epoch",
-            loss.detach(),
-            prog_bar=False,
-            logger=True,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        return loss
-
-    def configure_optimizers(self):
-        optim_name = str(self.train_cfg.get("optim", "adamw_torch")).lower()
-        if optim_name not in {"adamw_torch", "adamw"}:
-            raise ValueError(f"极简版目前只保留 adamw_torch / adamw，收到: {optim_name}")
-
-        optimizer = torch.optim.AdamW(
-            build_optimizer_param_groups(
-                self.model,
-                float(self.train_cfg.get("weight_decay", 0.0)),
-            ),
-            lr=float(self.train_cfg.get("learning_rate", 2e-5)),
-            betas=(0.9, 0.999),
-            eps=1e-8,
-        )
-
-        scheduler_name = str(self.train_cfg.get("lr_scheduler_type", "cosine"))
-        total_steps = int(self.trainer.estimated_stepping_batches)
-        warmup_steps = int(total_steps * float(self.train_cfg.get("warmup_ratio", 0.03)))
-        scheduler = get_scheduler(
-            name=scheduler_name,
-            optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-        )
-
-        scheduler_cfg: dict[str, Any] = {
-            "scheduler": scheduler,
-            "frequency": 1,
-        }
-
-        if scheduler_name == "reduce_lr_on_plateau":
-            scheduler_cfg["interval"] = "epoch"
-            scheduler_cfg["monitor"] = "train_loss_epoch"
-        else:
-            scheduler_cfg["interval"] = "step"
-
-        return {"optimizer": optimizer, "lr_scheduler": scheduler_cfg}
-
-    def save_hf_artifacts(self, output_dir: str) -> None:
-        os.makedirs(output_dir, exist_ok=True)
-        self.model.save_pretrained(output_dir)
-        self.processor.save_pretrained(output_dir)
-
-
-def build_train_dataloader(cfg: dict[str, Any], processor: AutoProcessor) -> tuple[MllmSFTDataset, DataLoader]:
-    dataset = MllmSFTDataset(cfg["data"], processor)
-    collator = LlavaSFTCollator(processor, int(cfg["data"].get("max_length", 2048)))
-    num_workers = int(cfg["train"].get("dataloader_num_workers", 4))
-
-    train_loader = DataLoader(
-        dataset,
-        batch_size=int(cfg["train"].get("per_device_train_batch_size", 1)),
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
-        collate_fn=collator,
-    )
-    return dataset, train_loader
-
-
-def build_trainer(cfg: dict[str, Any]) -> L.Trainer:
-    train_cfg = cfg["train"]
-    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    devices, num_nodes = infer_devices_and_nodes(accelerator)
-    precision = resolve_precision(train_cfg, accelerator)
-    strategy = resolve_strategy(train_cfg)
-    logger = build_logger(train_cfg)
-    checkpoint_callback = build_checkpoint_callback(train_cfg)
-
-    max_steps = train_cfg.get("max_steps")
-    if max_steps is not None:
-        max_steps = int(max_steps)
-        max_epochs = -1
-    else:
-        max_steps = -1
-        max_epochs = int(float(train_cfg.get("num_train_epochs", 1)))
-
-    return L.Trainer(
-        default_root_dir=train_cfg["output_dir"],
-        accelerator=accelerator,
-        devices=devices,
-        num_nodes=num_nodes,
-        strategy=strategy,
-        precision=precision,
-        accumulate_grad_batches=int(train_cfg.get("gradient_accumulation_steps", 1)),
-        max_epochs=max_epochs,
-        max_steps=max_steps,
-        log_every_n_steps=int(train_cfg.get("logging_steps", 10)),
-        callbacks=[checkpoint_callback],
-        logger=logger,
-        enable_model_summary=False,
-        num_sanity_val_steps=0,
-        use_distributed_sampler=True,
-    )
-
-
-def resolve_resume_path(path: str | None) -> str | None:
-    if not path:
-        return None
-    if path in {"last", "best", "hpc"} or str(path).endswith(".ckpt"):
-        return path
-
-    candidates = [
-        os.path.join(path, "last.ckpt"),
-        os.path.join(path, "checkpoints", "last.ckpt"),
-    ]
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-    return path
+    allowed = {k: v for k, v in cfg.items() if k in sig}
+    args = TrainingArguments(**allowed)
+    setattr(args, "save_model_at_end", bool(save_model_at_end))
+    return args
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    args = parser.parse_args()
+    args = parse_args()
+    cfg = apply_overrides(load_yaml(args.config), args.overrides)
 
-    cfg = load_yaml(args.config)
-    apply_runtime_flags(cfg["train"])
+    seed = int(cfg.get("seed", cfg.get("data", {}).get("seed", 42)))
+    set_seed(seed)
 
-    model, processor = load_model_and_processor(cfg["model"])
-    dataset, train_loader = build_train_dataloader(cfg, processor)
-    print(f"train examples: {len(dataset)}")
+    wandb_project = cfg.get("wandb_project") or cfg.get("train", {}).get("wandb_project")
+    if wandb_project:
+        os.environ.setdefault("WANDB_PROJECT", str(wandb_project))
 
-    lit_model = LlavaLightningModule(cfg, model, processor)
-    trainer = build_trainer(cfg)
-    ckpt_path = resolve_resume_path(cfg["train"].get("resume_from_checkpoint"))
-    trainer.fit(lit_model, train_dataloaders=train_loader, ckpt_path=ckpt_path)
+    model, processor, tokenizer = load_vision_language_model(cfg["model"])
+    model = apply_lora(model, cfg.get("lora", {}))
 
-    trainer.strategy.barrier()
-    if trainer.is_global_zero:
-        lit_model.save_hf_artifacts(cfg["train"]["output_dir"])
-    trainer.strategy.barrier()
+    data_cfg = cfg["data"]
+    spec = read_dataset_spec(data_cfg)
+    raw_ds = load_raw_dataset(data_cfg)
+    train_raw, eval_raw = split_train_eval(raw_ds, data_cfg)
+
+    image_seq_len = infer_image_seq_len(processor, model, data_cfg)
+    print(f"Using image_seq_len={image_seq_len}")
+    print(f"Loaded dataset={spec.dataset_name}, train={len(train_raw)}, eval={len(eval_raw) if eval_raw is not None else 0}")
+
+    train_ds = ShareGPTLlavaDataset(
+        train_raw,
+        tokenizer=tokenizer,
+        spec=spec,
+        cutoff_len=int(data_cfg.get("cutoff_len", 2048)),
+        image_seq_len=image_seq_len,
+        image_token=str(data_cfg.get("image_token", "<image>")),
+        add_default_system=bool(data_cfg.get("add_default_system", True)),
+        train_on_prompt=bool(data_cfg.get("train_on_prompt", False)),
+    )
+    eval_ds = None
+    if eval_raw is not None:
+        eval_ds = ShareGPTLlavaDataset(
+            eval_raw,
+            tokenizer=tokenizer,
+            spec=spec,
+            cutoff_len=int(data_cfg.get("cutoff_len", 2048)),
+            image_seq_len=image_seq_len,
+            image_token=str(data_cfg.get("image_token", "<image>")),
+            add_default_system=bool(data_cfg.get("add_default_system", True)),
+            train_on_prompt=bool(data_cfg.get("train_on_prompt", False)),
+        )
+
+    train_args = build_training_args(cfg["train"])
+    collator = LlavaDataCollator(
+        tokenizer=tokenizer,
+        processor=processor,
+        pad_to_multiple_of=cfg.get("train", {}).get("pad_to_multiple_of"),
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=train_args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        data_collator=collator,
+        tokenizer=tokenizer,
+    )
+    trainer.train(resume_from_checkpoint=cfg.get("train", {}).get("resume_from_checkpoint"))
+
+    if getattr(train_args, "save_model_at_end", False):
+        trainer.save_model(train_args.output_dir)
+        if hasattr(processor, "save_pretrained"):
+            processor.save_pretrained(train_args.output_dir)
+    else:
+        print("Training finished. Checkpoint/model saving disabled; metrics/logs are sent to W&B.")
 
 
 if __name__ == "__main__":
