@@ -93,6 +93,14 @@ def resolve_torch_dtype(name: Any):
     return mapping[str(name).lower()]
 
 
+def apply_runtime_flags(train_cfg: dict[str, Any]) -> None:
+    tf32 = bool(train_cfg.get("tf32", True))
+    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = tf32
+
+
 def load_vision_language_model(model_cfg: dict[str, Any]):
     """Load processor + LLaVA model while keeping imports compatible across Transformers versions."""
     model_name = model_cfg["model_name_or_path"]
@@ -300,6 +308,7 @@ def main() -> None:
 
     seed = int(cfg.get("seed", cfg.get("data", {}).get("seed", 42)))
     set_seed(seed)
+    apply_runtime_flags(cfg.get("train", {}))
 
     wandb_project = cfg.get("wandb_project") or cfg.get("train", {}).get("wandb_project")
     if wandb_project:

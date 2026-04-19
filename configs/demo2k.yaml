@@ -63,6 +63,7 @@ train:
   warmup_ratio: 0.03
   bf16: true
   fp16: false
+  tf32: true
   ddp_timeout: 180000000
   resume_from_checkpoint: null
 
