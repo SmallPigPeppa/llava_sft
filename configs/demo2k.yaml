@@ -28,7 +28,7 @@ lora:
   prepare_kbit: false
 
 data:
-  # Must contain dataset_info.json. For demo2k this file defines demo_2000 -> /ppio_net0/datasets/parquet/llava_779k_demo_2000
+  # Must contain dataset_info.json. For demo2k this file defines demo_2000 -> /ppio_net0/datasets/parquet/llava779k_demo2k
   dataset_dir: data/llava_779k_demo
   dataset: demo_2000
   template: llava

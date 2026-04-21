@@ -61,7 +61,7 @@ data:
 ```json
 {
   "demo_2000": {
-    "file_name": "/ppio_net0/datasets/parquet/llava_779k_demo_2000",
+    "file_name": "/ppio_net0/datasets/parquet/llava779k_demo2k",
     "formatting": "sharegpt",
     "columns": {
       "messages": "conversations",
